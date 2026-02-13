@@ -5,36 +5,44 @@
 namespace
 {
 const std::string kGenerateProbesShader = "RenderPasses/DDGIPass/GenerateProbes.cs.slang";
-const std::string kRTRadianceShader = "RenderPasses/DDGIPass/RTRadiance.rt.slang";
-const std::string kVisualizeProbesShader = "RenderPasses/DDGIPass/VisualizeProbe.ps.slang";
+const std::string kTraceGBufferShader = "RenderPasses/DDGIPass/TraceProbeGBuffer.rt.slang";
+const std::string kComputeRadianceShader = "RenderPasses/DDGIPass/ComputeRadiance.cs.slang";
+const std::string kComputeIrradianceShader = "RenderPasses/DDGIPass/ComputeIrradiance.cs.slang";
+const std::string kBlendShader = "RenderPasses/DDGIPass/Blend.ps.slang";
+const std::string kVisualizeShader = "RenderPasses/DDGIPass/VisualizeProbe.ps.slang";
 
-const char kOrigin[] = "origin";
-const char kSpacing[] = "spacing";
-const char kProbeCounts[] = "probeCounts";
-const char kVisualizeProbes[] = "visualizeProbes";
-const char kProbeRadius[] = "probeRadius";
-const char kProbeColor[] = "probeColor";
-const char kRayPerProbe[] = "rayPerProbe";
-const char kProbeMaxRayDistance[] = "probeMaxRayDistance";
-
-const std::string kColorOutput = "color";
-
-const ChannelList kOutputChannels = {
-    {kColorOutput, "gOutputColor", "Output color", false, ResourceFormat::RGBA32Float},
-};
+constexpr char kOrigin[] = "origin";
+constexpr char kSpacing[] = "spacing";
+constexpr char kProbeCounts[] = "probeCounts";
+constexpr char kTileResTrace[] = "tileResTrace";
+constexpr char kTileResRadiance[] = "tileResRadiance";
+constexpr char kTileResIrradiance[] = "tileResIrradiance";
+constexpr char kRaysPerProbe[] = "raysPerProbe";
+constexpr char kMaxRayDistance[] = "probeMaxRayDistance";
+constexpr char kGIIntensity[] = "giIntensity";
+constexpr char kVisualize[] = "visualizeProbes";
+constexpr char kProbeVizRadius[] = "probeVizRadius";
+constexpr char kProbeVizColor[] = "probeVizColor";
 } // namespace
 
-extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
+extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, DDGIPass>();
 }
 
-DDGIPass::DDGIPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
+DDGIPass::DDGIPass(const ref<Device>& pDevice, const Properties& props) : RenderPass(pDevice)
 {
     parseProperties(props);
 
-    // Create compute pass for generating probe positions
     mpGenerateProbesPass = ComputePass::create(mpDevice, kGenerateProbesShader, "main", DefineList(), true);
+    mpRadiancePass = ComputePass::create(mpDevice, kComputeRadianceShader, "main", DefineList(), true);
+    mpIrradiancePass = ComputePass::create(mpDevice, kComputeIrradianceShader, "main", DefineList(), true);
+
+    mpBlendProgram = Program::createGraphics(mpDevice, kBlendShader, "vsMain", "psMain");
+    mpBlendState = GraphicsState::create(mpDevice);
+    mpBlendState->setProgram(mpBlendProgram);
+
+    mDirty |= DDGIDirtyFlags::BlendProgram;
 }
 
 void DDGIPass::parseProperties(const Properties& props)
@@ -42,21 +50,29 @@ void DDGIPass::parseProperties(const Properties& props)
     for (const auto& [key, value] : props)
     {
         if (key == kOrigin)
-            mOrigin = value;
+            mOpt.origin = value, mDirty |= DDGIDirtyFlags::Probes;
         else if (key == kSpacing)
-            mSpacing = value;
+            mOpt.spacing = value, mDirty |= DDGIDirtyFlags::Probes;
         else if (key == kProbeCounts)
-            mProbeCounts = value;
-        else if (key == kVisualizeProbes)
-            mVisualizeProbes = value;
-        else if (key == kProbeRadius)
-            mProbeSphereRadius = value;
-        else if (key == kProbeColor)
-            mProbeColor = value;
-        else if (key == kRayPerProbe)
-            mRaysPerProbe = value;
-        else if (key == kProbeMaxRayDistance)
-            probeMaxRayDistance = value;
+            mOpt.probeCounts = value, mDirty |= (DDGIDirtyFlags::Probes | DDGIDirtyFlags::Atlases);
+        else if (key == kTileResTrace)
+            mOpt.tileResTrace = value, mDirty |= DDGIDirtyFlags::Atlases;
+        else if (key == kTileResRadiance)
+            mOpt.tileResRadiance = value, mDirty |= DDGIDirtyFlags::Atlases;
+        else if (key == kTileResIrradiance)
+            mOpt.tileResIrradiance = value, mDirty |= DDGIDirtyFlags::Atlases;
+        else if (key == kRaysPerProbe)
+            mOpt.raysPerProbe = value;
+        else if (key == kMaxRayDistance)
+            mOpt.maxRayDistance = value;
+        else if (key == kGIIntensity)
+            mOpt.giIntensity = value;
+        else if (key == kVisualize)
+            mOpt.visualizeProbes = value;
+        else if (key == kProbeVizRadius)
+            mOpt.probeVizRadius = value, mDirty |= DDGIDirtyFlags::VizResources;
+        else if (key == kProbeVizColor)
+            mOpt.probeVizColor = value;
         else
             logWarning("Unknown property '{}' in DDGIPass properties.", key);
     }
@@ -65,53 +81,84 @@ void DDGIPass::parseProperties(const Properties& props)
 Properties DDGIPass::getProperties() const
 {
     Properties props;
-    props[kOrigin] = mOrigin;
-    props[kSpacing] = mSpacing;
-    props[kProbeCounts] = mProbeCounts;
-    props[kVisualizeProbes] = mVisualizeProbes;
-    props[kProbeRadius] = mProbeSphereRadius;
-    props[kProbeColor] = mProbeColor;
-    props[kRayPerProbe] = mRaysPerProbe;
-    props[kProbeMaxRayDistance] = probeMaxRayDistance;
+    props[kOrigin] = mOpt.origin;
+    props[kSpacing] = mOpt.spacing;
+    props[kProbeCounts] = mOpt.probeCounts;
+    props[kTileResTrace] = mOpt.tileResTrace;
+    props[kTileResRadiance] = mOpt.tileResRadiance;
+    props[kTileResIrradiance] = mOpt.tileResIrradiance;
+    props[kRaysPerProbe] = mOpt.raysPerProbe;
+    props[kMaxRayDistance] = mOpt.maxRayDistance;
+    props[kGIIntensity] = mOpt.giIntensity;
+    props[kVisualize] = mOpt.visualizeProbes;
+    props[kProbeVizRadius] = mOpt.probeVizRadius;
+    props[kProbeVizColor] = mOpt.probeVizColor;
     return props;
 }
 
 RenderPassReflection DDGIPass::reflect(const CompileData& compileData)
 {
-    RenderPassReflection reflector;
+    RenderPassReflection r;
 
-    addRenderPassOutputs(reflector, kOutputChannels, ResourceBindFlags::RenderTarget);
+    r.addInput(kColorIn, "Base color buffer").bindFlags(ResourceBindFlags::ShaderResource);
+    r.addInput(kDepthIn, "Depth buffer").bindFlags(ResourceBindFlags::ShaderResource);
+    r.addInput(kNormalIn, "World normal or view normal")
+        .bindFlags(ResourceBindFlags::ShaderResource)
+        .flags(RenderPassReflection::Field::Flags::Optional);
+    r.addInput(kAlbedoIn, "Albedo buffer").bindFlags(ResourceBindFlags::ShaderResource).flags(RenderPassReflection::Field::Flags::Optional);
 
-    return reflector;
+    r.addOutput(kColorOut, "Output color").bindFlags(ResourceBindFlags::RenderTarget);
+
+    return r;
 }
 
 void DDGIPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     mpScene = pScene;
 
-    mpVisualizeProgram = nullptr;
-    mpVisualizeState = nullptr;
-    mpVisualizeVars = nullptr;
-    mpProbeSphereVao = nullptr;
+    mpTraceProgram = nullptr;
+    mpTraceSBT = nullptr;
+    mpTraceVars = nullptr;
 
-    if (mpScene)
+    if (!mpScene)
+        return;
+
+    const AABB b = mpScene->getSceneBounds();
+    mOpt.origin = b.minPoint;
+    const float3 extent = b.extent();
+    mOpt.spacing = extent / float3(max(uint3(1), mOpt.probeCounts));
+
+    mDirty |= DDGIDirtyFlags::Probes | DDGIDirtyFlags::Atlases | DDGIDirtyFlags::RtPrograms;
+}
+
+void DDGIPass::rebuildIfNeeded(RenderContext* ctx)
+{
+    if (is_set(mDirty, DDGIDirtyFlags::Probes))
     {
-        AABB sceneBounds = mpScene->getSceneBounds();
-        mOrigin = sceneBounds.minPoint;
+        prepareProbePositionsBuffer();
+    }
 
-        float3 sceneExtent = sceneBounds.extent();
-        mSpacing = sceneExtent / float3(mProbeCounts);
+    if (is_set(mDirty, DDGIDirtyFlags::Atlases))
+    {
+        prepareAtlases();
+    }
 
-        mProbesNeedUpdate = true;
+    if (is_set(mDirty, DDGIDirtyFlags::RtPrograms))
+    {
+        prepareTraceProgram();
+    }
+
+    if (is_set(mDirty, DDGIDirtyFlags::VizResources))
+    {
+        prepareVizResources();
     }
 }
 
-void DDGIPass::prepareProbeBuffer()
+void DDGIPass::prepareProbePositionsBuffer()
 {
-    if (uint32_t probeCount = mProbeCounts.x * mProbeCounts.y * mProbeCounts.z;
-        !mpProbePositionsBuffer || mpProbePositionsBuffer->getElementCount() < probeCount)
+    if (const uint32_t probeCount = getProbeCount(); !mpProbePositions || mpProbePositions->getElementCount() < probeCount)
     {
-        mpProbePositionsBuffer = mpDevice->createStructuredBuffer(
+        mpProbePositions = mpDevice->createStructuredBuffer(
             sizeof(float3),
             probeCount,
             ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
@@ -119,33 +166,100 @@ void DDGIPass::prepareProbeBuffer()
             nullptr,
             false
         );
-        mpProbePositionsBuffer->setName("DDGIPass::ProbePositions");
+        mpProbePositions->setName("DDGI::ProbePositions");
     }
 }
 
-void DDGIPass::generateProbes(RenderContext* pRenderContext)
+void DDGIPass::prepareAtlases()
 {
-    FALCOR_PROFILE(pRenderContext, "GenerateProbes");
+    const uint2 traceDim = getAtlasDims(mOpt.tileResTrace);
+    const uint2 radDim = getAtlasDims(mOpt.tileResRadiance);
+    const uint2 irrDim = getAtlasDims(mOpt.tileResIrradiance);
 
-    prepareProbeBuffer();
+    auto ensureTex2D = [&](ref<Texture>& tex, const uint2 dim, const ResourceFormat fmt, const char* name, const ResourceBindFlags flags)
+    {
+        if (!tex || tex->getWidth() != dim.x || tex->getHeight() != dim.y || tex->getFormat() != fmt)
+        {
+            tex = mpDevice->createTexture2D(dim.x, dim.y, fmt, 1, 1, nullptr, flags);
+            tex->setName(name);
+        }
+    };
 
-    auto var = mpGenerateProbesPass->getRootVar();
-    var["DDGIConstants"]["gOrigin"] = mOrigin;
-    var["DDGIConstants"]["gSpacing"] = mSpacing;
-    var["DDGIConstants"]["gProbeCounts"] = mProbeCounts;
-    var["gProbePositions"] = mpProbePositionsBuffer;
+    ensureTex2D(
+        mpHitPosAtlas,
+        traceDim,
+        ResourceFormat::RGBA32Float,
+        "DDGI::HitPosAtlas",
+        ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource
+    );
+    ensureTex2D(
+        mpHitNormalAtlas,
+        traceDim,
+        ResourceFormat::RGBA16Float,
+        "DDGI::HitNormalAtlas",
+        ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource
+    );
+    ensureTex2D(
+        mpHitAlbedoAtlas,
+        traceDim,
+        ResourceFormat::RGBA16Float,
+        "DDGI::HitAlbedoAtlas",
+        ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource
+    );
 
-    mpGenerateProbesPass->execute(pRenderContext, mProbeCounts.x, mProbeCounts.y, mProbeCounts.z);
+    ensureTex2D(
+        mpRadianceAtlas,
+        radDim,
+        ResourceFormat::RGBA16Float,
+        "DDGI::RadianceAtlas",
+        ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource
+    );
+    ensureTex2D(
+        mpIrradianceAtlas,
+        irrDim,
+        ResourceFormat::RGBA16Float,
+        "DDGI::IrradianceAtlas",
+        ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource
+    );
 
-    mProbesNeedUpdate = false;
+    mDirty &= ~DDGIDirtyFlags::Atlases;
 }
 
-void DDGIPass::prepareProbeVisualization()
+void DDGIPass::prepareTraceProgram()
 {
-    if (mpVisualizeProgram && mpProbeSphereVao)
+    if (!mpScene)
         return;
 
-    mpProbeSphere = TriangleMesh::createSphere(mProbeSphereRadius, 16, 8);
+    ProgramDesc desc;
+    desc.addShaderModules(mpScene->getShaderModules());
+    desc.addShaderLibrary(kTraceGBufferShader);
+
+    desc.setMaxPayloadSize(32);
+    desc.setMaxAttributeSize(mpScene->getRaytracingMaxAttributeSize());
+    desc.setMaxTraceRecursionDepth(1);
+
+    mpTraceSBT = RtBindingTable::create(1, 1, mpScene->getGeometryCount());
+    const auto& sbt = mpTraceSBT;
+
+    sbt->setRayGen(desc.addRayGen("rayGen"));
+    sbt->setMiss(0, desc.addMiss("miss"));
+
+    if (mpScene->hasGeometryType(Scene::GeometryType::TriangleMesh))
+    {
+        sbt->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), desc.addHitGroup("closestHit", "anyHit"));
+    }
+
+    mpTraceProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
+    mpTraceProgram->setTypeConformances(mpScene->getTypeConformances());
+
+    mpTraceVars = RtProgramVars::create(mpDevice, mpTraceProgram, mpTraceSBT);
+
+    mDirty &= ~DDGIDirtyFlags::RtPrograms;
+}
+
+void DDGIPass::prepareVizResources()
+{
+    mpProbeSphere = TriangleMesh::createSphere(mOpt.probeVizRadius, 16, 8);
 
     const auto& vertices = mpProbeSphere->getVertices();
     const auto& indices = mpProbeSphere->getIndices();
@@ -153,7 +267,6 @@ void DDGIPass::prepareProbeVisualization()
     const ref<Buffer> pVB = mpDevice->createBuffer(
         vertices.size() * sizeof(TriangleMesh::Vertex), ResourceBindFlags::Vertex, MemoryType::DeviceLocal, vertices.data()
     );
-
     const ref<Buffer> pIB =
         mpDevice->createBuffer(indices.size() * sizeof(uint32_t), ResourceBindFlags::Index, MemoryType::DeviceLocal, indices.data());
 
@@ -164,68 +277,222 @@ void DDGIPass::prepareProbeVisualization()
     pBufLayout->addElement("TEXCOORD", offsetof(TriangleMesh::Vertex, texCoord), ResourceFormat::RG32Float, 1, 2);
     pLayout->addBufferLayout(0, pBufLayout);
 
-    Vao::BufferVec buffers = {pVB};
+    const Vao::BufferVec buffers = {pVB};
     mpProbeSphereVao = Vao::create(Vao::Topology::TriangleList, pLayout, buffers, pIB, ResourceFormat::R32Uint);
 
-    mpVisualizeProgram = Program::createGraphics(mpDevice, kVisualizeProbesShader, "vsMain", "psMain");
+    mpVizProgram = Program::createGraphics(mpDevice, kVisualizeShader, "vsMain", "psMain");
 
-    mpVisualizeState = GraphicsState::create(mpDevice);
-    mpVisualizeState->setProgram(mpVisualizeProgram);
+    mpVizState = GraphicsState::create(mpDevice);
+    mpVizState->setProgram(mpVizProgram);
+    mpVizState->setVao(mpProbeSphereVao);
 
-    DepthStencilState::Desc dsDesc;
-    dsDesc.setDepthEnabled(true);
-    dsDesc.setDepthWriteMask(true);
-    dsDesc.setDepthFunc(ComparisonFunc::Less);
-    mpVisualizeState->setDepthStencilState(DepthStencilState::create(dsDesc));
+    DepthStencilState::Desc ds;
+    ds.setDepthEnabled(true);
+    ds.setDepthWriteMask(false);
+    ds.setDepthFunc(ComparisonFunc::LessEqual);
+    mpVizState->setDepthStencilState(DepthStencilState::create(ds));
 
-    RasterizerState::Desc rsDesc;
-    rsDesc.setCullMode(RasterizerState::CullMode::Back);
-    mpVisualizeState->setRasterizerState(RasterizerState::create(rsDesc));
+    RasterizerState::Desc rs;
+    rs.setCullMode(RasterizerState::CullMode::Back);
+    mpVizState->setRasterizerState(RasterizerState::create(rs));
 
-    mpVisualizeVars = ProgramVars::create(mpDevice, mpVisualizeProgram->getReflector());
+    mpVizVars = ProgramVars::create(mpDevice, mpVizProgram->getReflector());
+
+    mDirty &= ~DDGIDirtyFlags::VizResources;
 }
 
-void DDGIPass::visualizeProbes(RenderContext* pRenderContext, const RenderData& renderData)
+void DDGIPass::prepareBlendResources(const RenderData& rd)
 {
-    FALCOR_PROFILE(pRenderContext, "VisualizeProbes");
+    if (!mpBlendVars || is_set(mDirty, DDGIDirtyFlags::BlendProgram))
+    {
+        mpBlendVars = ProgramVars::create(mpDevice, mpBlendProgram->getReflector());
+        mDirty &= ~DDGIDirtyFlags::BlendProgram;
+    }
 
-    if (!mpScene)
+    auto out = rd.getTexture(kColorOut);
+    if (!out)
         return;
 
-    prepareProbeVisualization();
+    if (!mpBlendFbo || mpBlendFbo->getColorTexture(0) != out)
+    {
+        mpBlendFbo = Fbo::create(mpDevice, {out});
+    }
+}
 
-    if (!mpProbeSphereVao || !mpVisualizeProgram)
+void DDGIPass::stageGenerateProbes(RenderContext* ctx)
+{
+    FALCOR_PROFILE(ctx, "DDGI::GenerateProbes");
+
+    auto var = mpGenerateProbesPass->getRootVar();
+    var["DDGIConstants"]["gOrigin"] = mOpt.origin;
+    var["DDGIConstants"]["gSpacing"] = mOpt.spacing;
+    var["DDGIConstants"]["gProbeCounts"] = mOpt.probeCounts;
+    var["gProbePositions"] = mpProbePositions;
+
+    mpGenerateProbesPass->execute(ctx, mOpt.probeCounts.x, mOpt.probeCounts.y, mOpt.probeCounts.z);
+
+    mDirty &= ~DDGIDirtyFlags::Probes;
+}
+
+void DDGIPass::stageTraceProbeGBuffer(RenderContext* ctx) const
+{
+    if (!mOpt.enableTrace)
+        return;
+    if (!mpScene || !mpTraceProgram || !mpTraceVars)
         return;
 
-    auto pColorOutput = renderData.getTexture(kColorOutput);
-    if (!pColorOutput)
+    FALCOR_PROFILE(ctx, "DDGI::Trace(GBuffer)");
+
+    auto var = mpTraceVars->getRootVar();
+
+    mpScene->bindShaderData(var["gScene"]);
+
+    var["DDGIConstants"]["gProbeCounts"] = mOpt.probeCounts;
+    var["DDGIConstants"]["gTileRes"] = mOpt.tileResTrace;
+    var["DDGIConstants"]["gMaxRayDistance"] = mOpt.maxRayDistance;
+
+    var["gProbePositions"] = mpProbePositions;
+
+    var["gHitPosAtlas"] = mpHitPosAtlas;
+    var["gHitNormalAtlas"] = mpHitNormalAtlas;
+    var["gHitAlbedoAtlas"] = mpHitAlbedoAtlas;
+
+    const uint32_t totalProbes = getProbeCount();
+
+    mpScene->raytrace(ctx, mpTraceProgram.get(), mpTraceVars, uint3(mOpt.tileResTrace, mOpt.tileResTrace, totalProbes));
+}
+
+void DDGIPass::stageComputeRadiance(RenderContext* ctx) const
+{
+    if (!mOpt.enableRadiance)
         return;
 
-    ref<Texture> pDepthBuffer = mpDevice->createTexture2D(
-        pColorOutput->getWidth(), pColorOutput->getHeight(), ResourceFormat::D32Float, 1, 1, nullptr, ResourceBindFlags::DepthStencil
-    );
+    FALCOR_PROFILE(ctx, "DDGI::Radiance");
 
-    const ref<Fbo> pFbo = Fbo::create(mpDevice, {pColorOutput}, pDepthBuffer);
+    auto var = mpRadiancePass->getRootVar();
+    var["DDGIConstants"]["gTileResTrace"] = mOpt.tileResTrace;
+    var["DDGIConstants"]["gTileResRadiance"] = mOpt.tileResRadiance;
+    var["DDGIConstants"]["gProbeCounts"] = mOpt.probeCounts;
 
-    pRenderContext->clearFbo(pFbo.get(), float4(0.1f, 0.1f, 0.1f, 1.0f), 1.0f, 0, FboAttachmentType::All);
+    var["gHitPosAtlas"] = mpHitPosAtlas;
+    var["gHitNormalAtlas"] = mpHitNormalAtlas;
+    var["gHitAlbedoAtlas"] = mpHitAlbedoAtlas;
+    var["gRadianceAtlas"] = mpRadianceAtlas;
 
-    mpVisualizeState->setFbo(pFbo);
-    mpVisualizeState->setVao(mpProbeSphereVao);
+    const uint2 dim = getAtlasDims(mOpt.tileResRadiance);
+    mpRadiancePass->execute(ctx, div_round_up(dim.x, 8u), div_round_up(dim.y, 8u), 1u);
+}
 
-    const auto var = mpVisualizeVars->getRootVar();
+void DDGIPass::stageComputeIrradiance(RenderContext* ctx) const
+{
+    if (!mOpt.enableIrradiance)
+        return;
 
-    const auto& pCamera = mpScene->getCamera();
-    var["PerFrameCB"]["gViewProj"] = pCamera->getViewProjMatrix();
-    var["PerFrameCB"]["gCameraPos"] = pCamera->getPosition();
-    var["PerFrameCB"]["gProbeRadius"] = mProbeSphereRadius;
-    var["PerFrameCB"]["gProbeColor"] = mProbeColor;
+    FALCOR_PROFILE(ctx, "DDGI::Irradiance");
 
-    var["gProbePositions"] = mpProbePositionsBuffer;
+    auto var = mpIrradiancePass->getRootVar();
+    var["DDGIConstants"]["gTileResRadiance"] = mOpt.tileResRadiance;
+    var["DDGIConstants"]["gTileResIrradiance"] = mOpt.tileResIrradiance;
+    var["DDGIConstants"]["gProbeCounts"] = mOpt.probeCounts;
 
-    uint32_t probeCount = mProbeCounts.x * mProbeCounts.y * mProbeCounts.z;
-    uint32_t indexCount = static_cast<uint32_t>(mpProbeSphere->getIndices().size());
+    var["gRadianceAtlas"] = mpRadianceAtlas;
+    var["gIrradianceAtlas"] = mpIrradianceAtlas;
 
-    pRenderContext->drawIndexedInstanced(mpVisualizeState.get(), mpVisualizeVars.get(), indexCount, probeCount, 0, 0, 0);
+    const uint2 dim = getAtlasDims(mOpt.tileResIrradiance);
+    mpIrradiancePass->execute(ctx, div_round_up(dim.x, 8u), div_round_up(dim.y, 8u), 1u);
+}
+
+void DDGIPass::stageBlend(RenderContext* ctx, const RenderData& rd)
+{
+    if (!mOpt.enableBlend)
+        return;
+
+    FALCOR_PROFILE(ctx, "DDGI::Blend");
+
+    auto out = rd.getTexture(kColorOut);
+    if (!out)
+        return;
+
+    prepareBlendResources(rd);
+
+    auto colorIn = rd.getTexture(kColorIn);
+    auto depthIn = rd.getTexture(kDepthIn);
+    auto normalIn = rd.getTexture(kNormalIn);
+    auto albedoIn = rd.getTexture(kAlbedoIn);
+
+    if (!colorIn)
+        return;
+
+    mpBlendState->setFbo(mpBlendFbo);
+
+    auto var = mpBlendVars->getRootVar();
+    var["gColorIn"] = colorIn;
+    var["gDepthIn"] = depthIn;
+    var["gNormalIn"] = normalIn;
+    var["gAlbedoIn"] = albedoIn;
+
+    var["gProbePositions"] = mpProbePositions;
+    var["gIrradianceAtlas"] = mpIrradianceAtlas;
+
+    var["DDGIConstants"]["gOrigin"] = mOpt.origin;
+    var["DDGIConstants"]["gSpacing"] = mOpt.spacing;
+    var["DDGIConstants"]["gProbeCounts"] = mOpt.probeCounts;
+    var["DDGIConstants"]["gTileResIrradiance"] = mOpt.tileResIrradiance;
+    var["DDGIConstants"]["gGIIntensity"] = mOpt.giIntensity;
+
+    ctx->draw(mpBlendState.get(), mpBlendVars.get(), 3, 0);
+}
+
+void DDGIPass::stageVisualize(RenderContext* ctx, const RenderData& rd)
+{
+    if (!mOpt.visualizeProbes)
+        return;
+    if (!mpScene || !mpVizProgram || !mpProbeSphereVao)
+        return;
+
+    FALCOR_PROFILE(ctx, "DDGI::VisualizeProbes");
+
+    auto out = rd.getTexture(kColorOut);
+    if (!out)
+        return;
+
+    ref<Texture> depth = rd.getTexture(kDepthIn);
+    if (!depth)
+    {
+        if (!mpVizDepth || mpVizDepth->getWidth() != out->getWidth() || mpVizDepth->getHeight() != out->getHeight())
+        {
+            mpVizDepth = mpDevice->createTexture2D(
+                out->getWidth(), out->getHeight(), ResourceFormat::D32Float, 1, 1, nullptr, ResourceBindFlags::DepthStencil
+            );
+            mpVizDepth->setName("DDGI::VizDepth");
+        }
+        depth = mpVizDepth;
+
+        ctx->clearDsv(depth->getDSV().get(), 1.0f, 0);
+    }
+
+    if (!mpVizFbo || mpVizFboColor != out || mpVizFboDepth != depth)
+    {
+        mpVizFbo = Fbo::create(mpDevice, {out}, depth);
+        mpVizFboColor = out;
+        mpVizFboDepth = depth;
+    }
+
+    mpVizState->setFbo(mpVizFbo);
+
+    auto var = mpVizVars->getRootVar();
+    const auto& cam = mpScene->getCamera();
+    var["PerFrameCB"]["gViewProj"] = cam->getViewProjMatrix();
+    var["PerFrameCB"]["gProbeColor"] = mOpt.probeVizColor;
+    var["PerFrameCB"]["gProbeRadius"] = mOpt.probeVizRadius;
+    var["PerFrameCB"]["gCameraPos"] = cam->getPosition();
+
+    var["gProbePositions"] = mpProbePositions;
+
+    const uint32_t indexCount = static_cast<uint32_t>(mpProbeSphere->getIndices().size());
+    const uint32_t instCount = getProbeCount();
+
+    ctx->drawIndexedInstanced(mpVizState.get(), mpVizVars.get(), indexCount, instCount, 0, 0, 0);
 }
 
 void DDGIPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
@@ -234,59 +501,97 @@ void DDGIPass::execute(RenderContext* pRenderContext, const RenderData& renderDa
     if (mOptionsChanged)
     {
         const auto flags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
-        dict[kRenderPassRefreshFlags] = flags | Falcor::RenderPassRefreshFlags::RenderOptionsChanged;
+        dict[kRenderPassRefreshFlags] = flags | RenderPassRefreshFlags::RenderOptionsChanged;
         mOptionsChanged = false;
     }
 
     if (!mpScene)
         return;
 
-    if (mProbesNeedUpdate)
+    rebuildIfNeeded(pRenderContext);
+
+    if (is_set(mDirty, DDGIDirtyFlags::Probes))
+        stageGenerateProbes(pRenderContext);
+
+    stageTraceProbeGBuffer(pRenderContext);
+    stageComputeRadiance(pRenderContext);
+    stageComputeIrradiance(pRenderContext);
+    
+    if (mOpt.enableBlend)
     {
-        generateProbes(pRenderContext);
+        stageBlend(pRenderContext, renderData);
+    }
+    else
+    {
+        const auto colorIn = renderData.getTexture(kColorIn);
+        if (const auto colorOut = renderData.getTexture(kColorOut);colorIn && colorOut)
+        {
+            pRenderContext->blit(colorIn->getSRV(), colorOut->getRTV());
+        }
+        else if (colorOut)
+        {
+            pRenderContext->clearRtv(colorOut->getRTV().get(), float4(0.f, 0.f, 0.f, 1.f));
+        }
     }
 
-    if (mVisualizeProbes)
-    {
-        visualizeProbes(pRenderContext, renderData);
-    }
+    stageVisualize(pRenderContext, renderData);
 }
 
 void DDGIPass::renderUI(Gui::Widgets& widget)
 {
-    bool dirty = false;
+    bool dirtyProbes = false;
+    bool dirtyAtlases = false;
+    bool dirtyViz = false;
 
-    dirty |= widget.checkbox("Visualize Probes", mVisualizeProbes);
-    widget.tooltip("Toggle probe visualization.", true);
+    widget.text("DDGI Pipeline");
+    widget.separator();
 
-    dirty |= widget.var("Probe Radius", mProbeSphereRadius, 0.01f, 10.0f, 0.01f);
-    widget.tooltip("Radius of each probe.", true);
-
-    dirty |= widget.rgbColor("Probe Color", mProbeColor, true);
-    widget.tooltip("Probe visualization color.", true);
+    widget.checkbox("Visualize Probes", mOpt.visualizeProbes);
+    dirtyViz |= widget.var("Probe Viz Radius (world)", mOpt.probeVizRadius, 0.001f, 10.f, 0.001f);
+    widget.rgbColor("Probe Viz Color", mOpt.probeVizColor);
 
     widget.separator();
 
-    dirty |= widget.var("Origin", mOrigin, -1000.0f, 1000.0f, 0.1f);
-    widget.tooltip("Origin of the probe grid volume.", true);
+    dirtyProbes |= widget.var("Origin", mOpt.origin, -10000.f, 10000.f, 0.1f);
+    dirtyProbes |= widget.var("Spacing", mOpt.spacing, 0.001f, 1000.f, 0.01f);
 
-    dirty |= widget.var("Spacing", mSpacing, 0.01f, 100.0f, 0.1f);
-    widget.tooltip("Spacing between probes in each dimension.", true);
-
-    int3 probeCounts = int3(mProbeCounts);
-    if (widget.var("Probe Counts", probeCounts, 1, 128))
+    if (auto counts = int3(mOpt.probeCounts); widget.var("Probe Counts", counts, 1, 128))
     {
-        mProbeCounts = uint3(probeCounts);
-        dirty = true;
+        mOpt.probeCounts = uint3(counts);
+        dirtyProbes = true;
+        dirtyAtlases = true;
     }
-    widget.tooltip("Number of probes in each dimension.", true);
 
-    const uint32_t totalProbes = mProbeCounts.x * mProbeCounts.y * mProbeCounts.z;
-    widget.text("Total Probes: " + std::to_string(totalProbes));
+    widget.text("Total Probes: " + std::to_string(getProbeCount()));
+    widget.separator();
 
-    if (dirty)
+    dirtyAtlases |= widget.var("TileRes Trace", mOpt.tileResTrace, 4u, 64u);
+    dirtyAtlases |= widget.var("TileRes Radiance", mOpt.tileResRadiance, 4u, 64u);
+    dirtyAtlases |= widget.var("TileRes Irradiance", mOpt.tileResIrradiance, 2u, 32u);
+
+    widget.var("Max Ray Distance", mOpt.maxRayDistance, 1.f, 1e6f, 1.f);
+    widget.var("GI Intensity", mOpt.giIntensity, 0.f, 10.f, 0.01f);
+
+    widget.separator();
+    widget.text("Stages");
+    widget.checkbox("Enable Trace", mOpt.enableTrace);
+    widget.checkbox("Enable Radiance", mOpt.enableRadiance);
+    widget.checkbox("Enable Irradiance", mOpt.enableIrradiance);
+    widget.checkbox("Enable Blend", mOpt.enableBlend);
+
+    if (dirtyProbes)
     {
-        mProbesNeedUpdate = true;
+        mDirty |= DDGIDirtyFlags::Probes;
+        mOptionsChanged = true;
+    }
+    if (dirtyAtlases)
+    {
+        mDirty |= DDGIDirtyFlags::Atlases;
+        mOptionsChanged = true;
+    }
+    if (dirtyViz)
+    {
+        mDirty |= DDGIDirtyFlags::VizResources;
         mOptionsChanged = true;
     }
 }

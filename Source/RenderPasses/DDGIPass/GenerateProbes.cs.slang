@@ -7,7 +7,7 @@ cbuffer DDGIConstants
 
 RWStructuredBuffer<float3> gProbePositions;
 
-[numthreads(8, 8, 1)]
+[numthreads(1, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= gProbeCounts.x || id.y >= gProbeCounts.y || id.z >= gProbeCounts.z)
