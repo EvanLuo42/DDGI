@@ -65,10 +65,10 @@ private:
         float3 probeVizColor = float3(1.f);
 
         // Debug toggles
-        bool enableTrace = false;
-        bool enableRadiance = false;
-        bool enableIrradiance = false;
-        bool enableBlend = false;
+        bool enableTrace = true;
+        bool enableRadiance = true;
+        bool enableIrradiance = true;
+        bool enableBlend = true;
     };
 
     struct Resources
@@ -88,9 +88,9 @@ private:
 
     // Pipeline Stages
     void stageGenerateProbes(RenderContext* ctx);
-    void stageTraceProbeGBuffer(RenderContext* ctx)const;
-    void stageComputeRadiance(RenderContext* ctx)const;
-    void stageComputeIrradiance(RenderContext* ctx)const;
+    void stageTraceProbeGBuffer(RenderContext* ctx) const;
+    void stageComputeRadiance(RenderContext* ctx) const;
+    void stageComputeIrradiance(RenderContext* ctx) const;
     void stageBlend(RenderContext* ctx, const RenderData& rd);
     void stageVisualize(RenderContext* ctx, const RenderData& rd);
 
@@ -107,8 +107,6 @@ private:
 
     uint2 getAtlasDims(const uint32_t tileRes) const
     {
-        // width: probeCounts.x tiles horizontally
-        // height: (probeCounts.y * probeCounts.z) tiles vertically
         const uint32_t w = mOpt.probeCounts.x * tileRes;
         const uint32_t h = mOpt.probeCounts.y * mOpt.probeCounts.z * tileRes;
         return {w, h};
@@ -146,7 +144,7 @@ private:
     // GPU Resources
     ref<Buffer> mpProbePositions;
 
-    // Trace outputs (probe-space “GBuffer” atlases)
+    // Trace outputs (probe-space "GBuffer" atlases)
     ref<Texture> mpHitPosAtlas;    // RGBA32Float: xyz=wsPos
     ref<Texture> mpHitNormalAtlas; // RGBA16Float: xyz=wsNormal
     ref<Texture> mpHitAlbedoAtlas; // RGBA16Float: rgb=albedo
@@ -159,9 +157,15 @@ private:
     ref<Fbo> mpBlendFbo;
     ref<Texture> mpVizDepth; // cached depth for viz, if no depthIn wired
 
-    static constexpr auto kColorIn = "colorIn";
+    // Sample generator
+    ref<SampleGenerator> mpSampleGenerator;
+    ref<Sampler> mpLinearSampler;
+
+    uint32_t mFrameCount = 0;
+
     static constexpr auto kDepthIn = "depthIn";
     static constexpr auto kNormalIn = "normalIn";
     static constexpr auto kAlbedoIn = "albedoIn";
+    static constexpr auto kEmissiveIn = "emissiveIn";
     static constexpr auto kColorOut = "color";
 };

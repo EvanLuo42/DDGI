@@ -35,12 +35,9 @@ DDGIPass::DDGIPass(const ref<Device>& pDevice, const Properties& props) : Render
     parseProperties(props);
 
     mpGenerateProbesPass = ComputePass::create(mpDevice, kGenerateProbesShader, "main", DefineList(), true);
-    mpRadiancePass = ComputePass::create(mpDevice, kComputeRadianceShader, "main", DefineList(), true);
-    mpIrradiancePass = ComputePass::create(mpDevice, kComputeIrradianceShader, "main", DefineList(), true);
 
-    mpBlendProgram = Program::createGraphics(mpDevice, kBlendShader, "vsMain", "psMain");
-    mpBlendState = GraphicsState::create(mpDevice);
-    mpBlendState->setProgram(mpBlendProgram);
+    mpSampleGenerator = SampleGenerator::create(mpDevice, SAMPLE_GENERATOR_UNIFORM);
+    FALCOR_ASSERT(mpSampleGenerator)
 
     mDirty |= DDGIDirtyFlags::BlendProgram;
 }
@@ -100,12 +97,12 @@ RenderPassReflection DDGIPass::reflect(const CompileData& compileData)
 {
     RenderPassReflection r;
 
-    r.addInput(kColorIn, "Base color buffer").bindFlags(ResourceBindFlags::ShaderResource);
     r.addInput(kDepthIn, "Depth buffer").bindFlags(ResourceBindFlags::ShaderResource);
-    r.addInput(kNormalIn, "World normal or view normal")
+    r.addInput(kNormalIn, "World normal").bindFlags(ResourceBindFlags::ShaderResource).flags(RenderPassReflection::Field::Flags::Optional);
+    r.addInput(kAlbedoIn, "Albedo buffer").bindFlags(ResourceBindFlags::ShaderResource).flags(RenderPassReflection::Field::Flags::Optional);
+    r.addInput(kEmissiveIn, "Emissive buffer")
         .bindFlags(ResourceBindFlags::ShaderResource)
         .flags(RenderPassReflection::Field::Flags::Optional);
-    r.addInput(kAlbedoIn, "Albedo buffer").bindFlags(ResourceBindFlags::ShaderResource).flags(RenderPassReflection::Field::Flags::Optional);
 
     r.addOutput(kColorOut, "Output color").bindFlags(ResourceBindFlags::RenderTarget);
 
@@ -116,12 +113,24 @@ void DDGIPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     mpScene = pScene;
 
+    mFrameCount = 0;
+
     mpTraceProgram = nullptr;
     mpTraceSBT = nullptr;
     mpTraceVars = nullptr;
 
+    mpBlendProgram = nullptr;
+    mpBlendVars = nullptr;
+    mDirty |= DDGIDirtyFlags::BlendProgram;
+
     if (!mpScene)
         return;
+
+    auto defines = mpScene->getSceneDefines();
+    defines.add(mpSampleGenerator->getDefines());
+
+    mpRadiancePass = ComputePass::create(mpDevice, kComputeRadianceShader, "main", defines, true);
+    mpIrradiancePass = ComputePass::create(mpDevice, kComputeIrradianceShader, "main", defines, true);
 
     const AABB b = mpScene->getSceneBounds();
     mOpt.origin = b.minPoint;
@@ -234,7 +243,7 @@ void DDGIPass::prepareTraceProgram()
     desc.addShaderModules(mpScene->getShaderModules());
     desc.addShaderLibrary(kTraceGBufferShader);
 
-    desc.setMaxPayloadSize(32);
+    desc.setMaxPayloadSize(64);
     desc.setMaxAttributeSize(mpScene->getRaytracingMaxAttributeSize());
     desc.setMaxTraceRecursionDepth(1);
 
@@ -244,10 +253,18 @@ void DDGIPass::prepareTraceProgram()
     sbt->setRayGen(desc.addRayGen("rayGen"));
     sbt->setMiss(0, desc.addMiss("miss"));
 
-    if (mpScene->hasGeometryType(Scene::GeometryType::TriangleMesh))
+    std::vector<GlobalGeometryID> all;
+
+    for (const auto t : {Scene::GeometryType::TriangleMesh, Scene::GeometryType::DisplacedTriangleMesh, Scene::GeometryType::Curve})
     {
-        sbt->setHitGroup(0, mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh), desc.addHitGroup("closestHit", "anyHit"));
+        if (mpScene->hasGeometryType(t))
+        {
+            auto ids = mpScene->getGeometryIDs(t);
+            all.insert(all.end(), ids.begin(), ids.end());
+        }
     }
+    if (!all.empty())
+        sbt->setHitGroup(0, all, desc.addHitGroup("closestHit", "anyHit"));
 
     mpTraceProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
     mpTraceProgram->setTypeConformances(mpScene->getTypeConformances());
@@ -303,8 +320,34 @@ void DDGIPass::prepareVizResources()
 
 void DDGIPass::prepareBlendResources(const RenderData& rd)
 {
-    if (!mpBlendVars || is_set(mDirty, DDGIDirtyFlags::BlendProgram))
+    // Recreate blend program with scene defines so it can access gScene
+    if (!mpBlendProgram || is_set(mDirty, DDGIDirtyFlags::BlendProgram))
     {
+        DefineList defines;
+        if (mpScene)
+        {
+            defines.add(mpScene->getSceneDefines());
+        }
+
+        ProgramDesc desc;
+        if (mpScene)
+        {
+            desc.addShaderModules(mpScene->getShaderModules());
+        }
+        desc.addShaderLibrary(kBlendShader).vsEntry("vsMain").psEntry("psMain");
+        if (mpScene)
+        {
+            desc.addTypeConformances(mpScene->getTypeConformances());
+        }
+
+        mpBlendProgram = Program::create(mpDevice, desc, defines);
+
+        mpBlendState = GraphicsState::create(mpDevice);
+        mpBlendState->setProgram(mpBlendProgram);
+
+        ref<VertexLayout> pLayout = VertexLayout::create();
+        mpBlendState->setVao(Vao::create(Vao::Topology::TriangleList, pLayout));
+
         mpBlendVars = ProgramVars::create(mpDevice, mpBlendProgram->getReflector());
         mDirty &= ~DDGIDirtyFlags::BlendProgram;
     }
@@ -323,7 +366,7 @@ void DDGIPass::stageGenerateProbes(RenderContext* ctx)
 {
     FALCOR_PROFILE(ctx, "DDGI::GenerateProbes");
 
-    auto var = mpGenerateProbesPass->getRootVar();
+    const auto var = mpGenerateProbesPass->getRootVar();
     var["DDGIConstants"]["gOrigin"] = mOpt.origin;
     var["DDGIConstants"]["gSpacing"] = mOpt.spacing;
     var["DDGIConstants"]["gProbeCounts"] = mOpt.probeCounts;
@@ -343,7 +386,7 @@ void DDGIPass::stageTraceProbeGBuffer(RenderContext* ctx) const
 
     FALCOR_PROFILE(ctx, "DDGI::Trace(GBuffer)");
 
-    auto var = mpTraceVars->getRootVar();
+    const auto var = mpTraceVars->getRootVar();
 
     mpScene->bindShaderData(var["gScene"]);
 
@@ -369,18 +412,25 @@ void DDGIPass::stageComputeRadiance(RenderContext* ctx) const
 
     FALCOR_PROFILE(ctx, "DDGI::Radiance");
 
-    auto var = mpRadiancePass->getRootVar();
+    const auto var = mpRadiancePass->getRootVar();
     var["DDGIConstants"]["gTileResTrace"] = mOpt.tileResTrace;
     var["DDGIConstants"]["gTileResRadiance"] = mOpt.tileResRadiance;
     var["DDGIConstants"]["gProbeCounts"] = mOpt.probeCounts;
+
+    var["PerFrameCB"]["gFrameCount"] = mFrameCount;
 
     var["gHitPosAtlas"] = mpHitPosAtlas;
     var["gHitNormalAtlas"] = mpHitNormalAtlas;
     var["gHitAlbedoAtlas"] = mpHitAlbedoAtlas;
     var["gRadianceAtlas"] = mpRadianceAtlas;
 
+    mpSampleGenerator->bindShaderData(var);
+
+    mpScene->bindShaderData(var["gScene"]);
+    mpScene->bindShaderDataForRaytracing(ctx, var["gScene"]);
+
     const uint2 dim = getAtlasDims(mOpt.tileResRadiance);
-    mpRadiancePass->execute(ctx, div_round_up(dim.x, 8u), div_round_up(dim.y, 8u), 1u);
+    mpRadiancePass->execute(ctx, dim.x, dim.y, 1u);
 }
 
 void DDGIPass::stageComputeIrradiance(RenderContext* ctx) const
@@ -399,7 +449,7 @@ void DDGIPass::stageComputeIrradiance(RenderContext* ctx) const
     var["gIrradianceAtlas"] = mpIrradianceAtlas;
 
     const uint2 dim = getAtlasDims(mOpt.tileResIrradiance);
-    mpIrradiancePass->execute(ctx, div_round_up(dim.x, 8u), div_round_up(dim.y, 8u), 1u);
+    mpIrradiancePass->execute(ctx, dim.x, dim.y, 1u);
 }
 
 void DDGIPass::stageBlend(RenderContext* ctx, const RenderData& rd)
@@ -415,30 +465,46 @@ void DDGIPass::stageBlend(RenderContext* ctx, const RenderData& rd)
 
     prepareBlendResources(rd);
 
-    auto colorIn = rd.getTexture(kColorIn);
     auto depthIn = rd.getTexture(kDepthIn);
     auto normalIn = rd.getTexture(kNormalIn);
     auto albedoIn = rd.getTexture(kAlbedoIn);
+    auto emissiveIn = rd.getTexture(kEmissiveIn);
 
-    if (!colorIn)
+    if (!depthIn)
         return;
 
     mpBlendState->setFbo(mpBlendFbo);
 
     auto var = mpBlendVars->getRootVar();
-    var["gColorIn"] = colorIn;
+
+    mpScene->bindShaderData(var["gScene"]);
+
     var["gDepthIn"] = depthIn;
     var["gNormalIn"] = normalIn;
     var["gAlbedoIn"] = albedoIn;
+    var["gEmissiveIn"] = emissiveIn;
 
     var["gProbePositions"] = mpProbePositions;
     var["gIrradianceAtlas"] = mpIrradianceAtlas;
+
+    if (!mpLinearSampler)
+    {
+        Sampler::Desc desc;
+        desc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear);
+        desc.setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+        mpLinearSampler = mpDevice->createSampler(desc);
+    }
+    var["gSampler"] = mpLinearSampler;
 
     var["DDGIConstants"]["gOrigin"] = mOpt.origin;
     var["DDGIConstants"]["gSpacing"] = mOpt.spacing;
     var["DDGIConstants"]["gProbeCounts"] = mOpt.probeCounts;
     var["DDGIConstants"]["gTileResIrradiance"] = mOpt.tileResIrradiance;
     var["DDGIConstants"]["gGIIntensity"] = mOpt.giIntensity;
+
+    const auto& cam = mpScene->getCamera();
+    var["PerFrameCB"]["gInvViewProj"] = cam->getInvViewProjMatrix();
+    var["PerFrameCB"]["gCameraPos"] = cam->getPosition();
 
     ctx->draw(mpBlendState.get(), mpBlendVars.get(), 3, 0);
 }
@@ -480,7 +546,7 @@ void DDGIPass::stageVisualize(RenderContext* ctx, const RenderData& rd)
 
     mpVizState->setFbo(mpVizFbo);
 
-    auto var = mpVizVars->getRootVar();
+    const auto var = mpVizVars->getRootVar();
     const auto& cam = mpScene->getCamera();
     var["PerFrameCB"]["gViewProj"] = cam->getViewProjMatrix();
     var["PerFrameCB"]["gProbeColor"] = mOpt.probeVizColor;
@@ -516,25 +582,22 @@ void DDGIPass::execute(RenderContext* pRenderContext, const RenderData& renderDa
     stageTraceProbeGBuffer(pRenderContext);
     stageComputeRadiance(pRenderContext);
     stageComputeIrradiance(pRenderContext);
-    
+
     if (mOpt.enableBlend)
     {
         stageBlend(pRenderContext, renderData);
     }
     else
     {
-        const auto colorIn = renderData.getTexture(kColorIn);
-        if (const auto colorOut = renderData.getTexture(kColorOut);colorIn && colorOut)
-        {
-            pRenderContext->blit(colorIn->getSRV(), colorOut->getRTV());
-        }
-        else if (colorOut)
+        if (const auto colorOut = renderData.getTexture(kColorOut))
         {
             pRenderContext->clearRtv(colorOut->getRTV().get(), float4(0.f, 0.f, 0.f, 1.f));
         }
     }
 
     stageVisualize(pRenderContext, renderData);
+
+    mFrameCount++;
 }
 
 void DDGIPass::renderUI(Gui::Widgets& widget)

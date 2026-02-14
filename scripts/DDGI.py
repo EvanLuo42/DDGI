@@ -15,10 +15,27 @@ def render_graph_DDGI():
     })
     g.addPass(DDGI, "DDGI")
 
-    g.addEdge("GBuffer.depth", "DDGI.depthIn")
-    g.addEdge("GBuffer.diffuseOpacity", "DDGI.colorIn")
+    AccumulatePass = createPass("AccumulatePass", {
+        "enabled": True,
+        "precisionMode": "Single"
+    })
+    g.addPass(AccumulatePass, "AccumulatePass")
 
-    g.markOutput("DDGI.color")
+    ToneMapper = createPass("ToneMapper", {
+        "autoExposure": False,
+        "exposureCompensation": 0.0
+    })
+    g.addPass(ToneMapper, "ToneMapper")
+
+    g.addEdge("GBuffer.depth", "DDGI.depthIn")
+    g.addEdge("GBuffer.normW", "DDGI.normalIn")
+    g.addEdge("GBuffer.diffuseOpacity", "DDGI.albedoIn")
+    g.addEdge("GBuffer.emissive", "DDGI.emissiveIn")
+
+    g.addEdge("DDGI.color", "AccumulatePass.input")
+    g.addEdge("AccumulatePass.output", "ToneMapper.src")
+
+    g.markOutput("ToneMapper.dst")
 
     return g
 

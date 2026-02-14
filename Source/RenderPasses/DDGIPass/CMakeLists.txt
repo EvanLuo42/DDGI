@@ -7,6 +7,7 @@ target_sources(DDGIPass PRIVATE
     ComputeRadiance.cs.slang
     GenerateProbes.cs.slang
     TraceProbeGBuffer.rt.slang
+    Blend.ps.slang
 )
 
 target_copy_shaders(DDGIPass RenderPasses/DDGIPass)
